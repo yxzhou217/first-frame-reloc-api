@@ -29,7 +29,7 @@ pip install -r requirements.txt
 python build_map_db.py --map_npz /path/to/map.npz --out /path/to/db.npz
 ```
 
-注意:建图帧若已旋正(如 VidMap 抽帧已应用旋转元数据),启动服务时须加 `--no_rotate`。
+注意:建图帧若已旋正(如 VidMap 抽帧已应用旋转元数据),启动服务时须加 `--no_rotate`。查询照片的方向处理，必须和建图帧的方向处理保持一致。
 
 ## 启动与停止
 
@@ -73,6 +73,7 @@ curl -X POST http://127.0.0.1:8100/localize -F "file=@photo.jpg"
 ```
 
 ```python
+# 代码中调用api
 import requests
 with open("photo.jpg", "rb") as f:
     res = requests.post("http://127.0.0.1:8100/localize",
