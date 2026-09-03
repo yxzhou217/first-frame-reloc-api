@@ -9,6 +9,13 @@ if pgrep -f "reloc_server.py" > /dev/null; then
     exit 0
 fi
 
+# 启动前检查当前 python 环境依赖是否齐全(防止用错 conda 环境时静默失败)
+if ! python -c "import torch, transformers, fastapi, uvicorn, PIL, requests" 2>/dev/null; then
+    echo "错误: 当前 python($(which python))缺依赖,你是不是没激活装了依赖的 conda 环境?"
+    echo "先执行: conda activate <环境名>  (环境安装见 README)"
+    exit 1
+fi
+
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 nohup python reloc_server.py "$@" > reloc_server.log 2>&1 &
