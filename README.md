@@ -15,7 +15,7 @@ cd lingbot-map && pip install -e . && cd ..
 # 按上游 README 下载模型权重,记为 /path/to/lingbot-map-long.pt
 
 # 3. 本仓库
-git clone <本仓库地址> && cd first-frame-reloc-api
+git clone https://github.com/yxzhou217/first-frame-reloc-api && cd first-frame-reloc-api
 pip install -r requirements.txt
 ```
 
@@ -26,7 +26,7 @@ pip install -r requirements.txt
 ```bash
 # 建图 npz(images + 位姿 w2c + 内参)由 lingbot-map / VidMap 等工具产出
 # 然后构建检索数据库:
-python build_map_db.py --map_npz output/map.npz --out output/db.npz
+python build_map_db.py --map_npz /path/to/map.npz --out /path/to/db.npz
 ```
 
 注意:建图帧若已旋正(如 VidMap 抽帧已应用旋转元数据),启动服务时须加 `--no_rotate`。
@@ -67,11 +67,9 @@ bash stop.sh               # 或 pkill -f reloc_server.py;前台运行则 Ctrl+C
 ## 调用
 
 ```bash
-# 上传文件(推荐)
+# 上传文件(比如查询图的路径为photo.jpg)
 curl -X POST http://127.0.0.1:8100/localize -F "file=@photo.jpg"
 
-# 其它机器调用:把 127.0.0.1 换成服务器 IP
-# 查询图若已是地图同规格帧(如直接取自建图 npz),加 ?rotate=false
 ```
 
 ```python
@@ -99,7 +97,7 @@ else:
 
 ```bash
 # 服务运行中,把留出帧当查询打给 API(真值取自地图自身,属自洽性评估)
-python eval_via_api.py --num_queries 100 --map_npz output/map.npz --db output/db.npz
+python eval_via_api.py --num_queries 100 --map_npz /path/to/map.npz --db /path/to/db.npz
 # 关键帧地图加 --db_stride 2(与服务启动一致);--num_queries 999 = 查询全测
 ```
 
