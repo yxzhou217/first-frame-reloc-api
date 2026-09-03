@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+output/
+checkpoints/
+*.npz
+*.log
+.DS_Store
