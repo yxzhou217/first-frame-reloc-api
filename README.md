@@ -3,16 +3,7 @@
 机器人"苏醒时拍一张照片 → 返回它在地图里的位姿"的 HTTP 服务。
 基于 [lingbot-map](https://github.com/robbyant/lingbot-map) 做窗口联合重建,专为室内巡检机器人设计。
 
-**管线(seed_expand)**:DINOv2 全局描述子检索 → VLM(Qwen3-VL 等)逐对确认主帧 → 主帧时间邻居凑窗口 → lingbot-map 窗口联合重建 → Sim(3) 对齐到地图坐标系。
-
-## 实测精度(留出法自洽性评估,经真实 HTTP 调用)
-
-| 场景 | 例数 | 错误位姿 | 位置误差中位 | 旋转误差中位 | 单次耗时 |
-|---|---|---|---|---|---|
-| 售楼处(VidMap 稠密地图,1108 帧) | 100 | **0** | 0.11×基线 | 0.50° | 2~4s |
-| 住宅(VidMap 关键帧地图,190 帧) | 95(全测) | **0** | 0.042 米 | 0.51° | 2~3s |
-
-地图为米制尺度时(VidMap),返回的 `position` 单位是米。
+**管线(seed_expand)**:DINOv2 全局描述子检索 → VLM(Qwen3-VL)逐对确认主帧 → 主帧时间邻居凑窗口 → lingbot-map 窗口联合重建 → Sim(3) 对齐到地图坐标系。
 
 ## 环境安装
 
@@ -81,6 +72,20 @@ python reloc_server.py \
 
 启动约需 2~5 分钟(模型加载),`curl http://127.0.0.1:8100/health` 返回 `{"status":"ok"}` 即就绪。
 
+### GPU 指定与启停
+
+```bash
+# 指定 GPU(代码不用改:CUDA_VISIBLE_DEVICES 会遮住其它卡,进程只看到指定的卡)
+CUDA_VISIBLE_DEVICES=0 python reloc_server.py ...   # 用 0 号卡;N 换成任意卡号
+
+# 或用仓库自带的脚本(默认 GPU 0,后台运行,日志在 reloc_server.log)
+CUDA_VISIBLE_DEVICES=0 bash start.sh --map_npz output/map.npz --db output/db.npz --model_path /path/to/lingbot-map-long.pt
+
+# 停止服务(释放显存)
+bash stop.sh
+# 或手动: pkill -f reloc_server.py  (前台运行的话直接 Ctrl+C)
+```
+
 ## 调用 API
 
 ### 上传文件(推荐)
@@ -140,6 +145,7 @@ python eval_via_api.py --num_queries 100 \
 | `build_map_db.py` | 构建检索数据库 |
 | `eval_via_api.py` | 经 HTTP 的留出法评估 |
 | `eval_heldout.py` | 离线留出法评估(含 patch 重排等实验模式) |
+| `start.sh` / `stop.sh` | 启停脚本(后台运行、GPU 指定、停止释放显存) |
 
 ## 许可
 
