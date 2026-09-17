@@ -1,7 +1,8 @@
 """reloc_server.py — 首帧定位 API 服务(seed_expand 管线,2026-08-17)
 
 把 eval_heldout.py 验证过的 seed_expand 管线包成 HTTP 服务:
-  DINO 检索 → VLM 按相似度顺序验证(第一个 Yes = 主帧) → 主帧时间邻居凑窗口
+  DINO 检索 → VLM 按相似度顺序验证(第一个 Yes = 主帧) → 主帧邻居凑窗口
+  (默认空间近邻:位置+朝向筛选,不依赖时间信息;--window_mode temporal 可切回时间邻居)
   → lingbot 窗口联合重建 → Sim(3) 对齐 → 返回查询帧在地图坐标系中的位姿
 
 接口:
@@ -310,9 +311,9 @@ def main():
     parser.add_argument("--dino_path", default="facebook/dinov2-small")
     parser.add_argument("--k", type=int, default=8)
     parser.add_argument("--window_mode", choices=["temporal", "spatial"],
-                        default="temporal",
-                        help="锚点窗口选取: temporal=主帧时间邻居(默认,需帧号沿轨迹有序); "
-                             "spatial=空间近邻(位置+朝向筛选,不依赖时间信息)")
+                        default="spatial",
+                        help="锚点窗口选取: spatial=空间近邻(位置+朝向筛选,默认,不依赖时间信息); "
+                             "temporal=主帧时间邻居(仅当地图帧号沿轨迹有序时可用)")
     parser.add_argument("--spatial_diversity", action="store_true",
                         help="spatial 模式加贪心方位多样性(防锚点挤同一侧,稀疏地图建议开)")
     parser.add_argument("--target_db_ratio", type=float, default=0.46)

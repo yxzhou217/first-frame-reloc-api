@@ -141,9 +141,9 @@ def main():
                         help="主帧扩展模式: VLM 按相似度顺序验证,第一个 Yes 作主帧,"
                              "用主帧的邻居凑满窗口(隐含启用 VLM)")
     parser.add_argument("--window_mode", choices=["temporal", "spatial"],
-                        default="temporal",
-                        help="seed_expand 的窗口选取: temporal=时间邻居(默认); "
-                             "spatial=空间近邻(位置+朝向筛选,不依赖时间信息)")
+                        default="spatial",
+                        help="seed_expand 的窗口选取: spatial=空间近邻(位置+朝向筛选,默认,"
+                             "不依赖时间信息); temporal=时间邻居(需帧号沿轨迹有序)")
     parser.add_argument("--spatial_diversity", action="store_true",
                         help="spatial 模式加贪心方位多样性(防锚点挤同一侧)")
     parser.add_argument("--queries", type=int, nargs="*", default=None,

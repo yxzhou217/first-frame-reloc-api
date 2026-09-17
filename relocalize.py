@@ -2,7 +2,9 @@
 
 ⚠ 本文件不是线上管线!当前首帧定位管线是 seed_expand(2026-08-17):
   DINO 检索(只定顺序) → VLM 逐候选验证,第一个 Yes = 主帧
-  → 主帧时间邻居(±1,±2,...)凑窗口 → 窗口联合重建 → 旋转一致性 Sim(3) 对齐
+  → 主帧邻居凑窗口(2026-09-17 起默认空间近邻 spatial_neighbors:位置+朝向筛选,
+    不依赖时间信息;时间邻居 temporal_neighbors 保留,--window_mode 切换)
+  → 窗口联合重建 → 旋转一致性 Sim(3) 对齐
   线上服务见 reloc_server.py;离线评估见 eval_heldout.py --seed_expand。
   旧的"检索 top-k 直接凑窗口"做法已废弃,相关脚本在 archive_old_topk/。
 

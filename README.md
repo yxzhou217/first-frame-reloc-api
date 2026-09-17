@@ -1,7 +1,14 @@
 # 首帧定位 API(First-Frame Relocalization API)
 
 机器人"苏醒时拍一张照片 → 返回它在地图里的位姿"的 HTTP 服务。
-管线:DINOv2 检索 → VLM 逐对确认主帧 → 主帧时间邻居凑窗口 → [lingbot-map](https://github.com/robbyant/lingbot-map) 窗口联合重建 → Sim(3) 对齐到地图坐标系。
+管线:DINOv2 检索 → VLM 逐对确认主帧 → 主帧邻居凑窗口(默认空间近邻,见下) → [lingbot-map](https://github.com/robbyant/lingbot-map) 窗口联合重建 → Sim(3) 对齐到地图坐标系。
+
+**窗口选取两种模式**(`--window_mode`,默认 `spatial`):
+
+- `spatial`(默认,2026-09-17 起):空间近邻——以主帧位置为圆心、按"基线倍数"的半径画圈,再筛掉与主帧朝向夹角 >60° 的帧(防背对背),按"越近越同向"排序凑满窗口;凑不齐就放宽半径和锥角,最差退化为全图最近邻。**不依赖帧号沿轨迹有序**,回环处还能跨时间段选到空间上相近的帧(时间窗口做不到)。
+- `temporal`:主帧的时间邻居(±1,±2,...),仅当地图帧号沿轨迹有序时可用。
+
+稀疏地图建议加 `--spatial_diversity`(贪心方位多样性,防锚点全挤在主帧同一侧导致窗口基线退化)。
 
 ## 环境安装
 
@@ -60,6 +67,8 @@ bash stop.sh               # 或 pkill -f reloc_server.py;前台运行则 Ctrl+C
 | `--vlm_url` / `--vlm_model` | — | VLM 端点(兼容 OpenAI Vision API)/ 模型名 |
 | `--no_vlm` | 关 | 不用 VLM(仅调试,精度会降) |
 | `--k` | 8 | 窗口锚点数 |
+| `--window_mode` | `spatial` | 窗口选取:`spatial`=空间近邻(不依赖时间信息);`temporal`=时间邻居(需帧号有序) |
+| `--spatial_diversity` | 关 | spatial 模式加贪心方位多样性(稀疏地图建议开) |
 | `--db_stride` | 无 | 隔 N 取一作检索库;关键帧地图建议 2(稠密帧地图用默认的空间子采样即可) |
 | `--no_rotate` | 关 | 查询照片不顺时针转 90°(地图帧已转正时必须加) |
 | `--port` | 8100 | 监听端口;8100 被占或多实例时才需要改 |
@@ -100,6 +109,12 @@ else:
 # 服务运行中,把留出帧当查询打给 API(真值取自地图自身,属自洽性评估)
 python eval_via_api.py --num_queries 100 --map_npz /path/to/map.npz --db /path/to/db.npz
 # 关键帧地图加 --db_stride 2(与服务启动一致);--num_queries 999 = 查询全测
+
+# 离线评估(不经 HTTP,可对比窗口模式等开关)
+python eval_heldout.py --map_npz /path/to/map.npz --db /path/to/db.npz \
+    --seed_expand --window_mode spatial --num_queries 30
+# 注意:关键帧地图(VidMap/COLMAP 关键帧已按运动阈值稀疏化)须加 --exclude_radius 0,
+# 否则默认排除查询 ±30 帧会把合法近邻全部砍掉,误差虚高数十倍
 ```
 
 ## 文件说明
