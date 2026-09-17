@@ -139,7 +139,13 @@ def main():
     # 其余锚点用主帧的时间邻居(±1,±2,...)凑满,不再从检索结果里凑
     parser.add_argument("--seed_expand", action="store_true",
                         help="主帧扩展模式: VLM 按相似度顺序验证,第一个 Yes 作主帧,"
-                             "用主帧的时间邻居凑满窗口(隐含启用 VLM)")
+                             "用主帧的邻居凑满窗口(隐含启用 VLM)")
+    parser.add_argument("--window_mode", choices=["temporal", "spatial"],
+                        default="temporal",
+                        help="seed_expand 的窗口选取: temporal=时间邻居(默认); "
+                             "spatial=空间近邻(位置+朝向筛选,不依赖时间信息)")
+    parser.add_argument("--spatial_diversity", action="store_true",
+                        help="spatial 模式加贪心方位多样性(防锚点挤同一侧)")
     parser.add_argument("--queries", type=int, nargs="*", default=None,
                         help="只测这些全局帧号(必须在留出查询池里),如 --queries 97 98 100")
     args = parser.parse_args()
@@ -213,7 +219,7 @@ def main():
         qids = np.array([np.where(q_pool == f)[0][0] for f in args.queries])
     mode_str = "自适应(相似度阈值+空间聚类)" if args.adaptive else "固定top-k"
     if args.seed_expand:
-        mode_str = "主帧+时间邻居扩展(seed_expand)"
+        mode_str = f"主帧+{args.window_mode}邻居扩展(seed_expand)"
     elif args.vlm_verify:
         mode_str += "+VLM验证"
     print(f"抽 {len(qids)} 个查询帧,k={args.k}, 检索模式: {mode_str}\n")
@@ -299,16 +305,16 @@ def main():
                     print(f"  ⚠ VLM 全部拒绝 {fetch} 个候选,退回 DINO top-1 作主帧")
                 seed_frame = int(db_idx[cand[0]])
 
-            # 时间扩展: 主帧 ±1,±2,...,按 |Δ| 从小到大凑满 k 个锚点
-            neighbors = []
-            d = 1
-            while len(neighbors) < args.k - 1 and d < n:
-                for f in (seed_frame - d, seed_frame + d):
-                    if 0 <= f < n and f != q_frame and f not in neighbors:
-                        neighbors.append(f)
-                        if len(neighbors) >= args.k - 1:
-                            break
-                d += 1
+            # 邻居扩展凑满 k 个锚点(--window_mode):
+            # temporal: 主帧 ±1,±2,...,按 |Δ| 从小到大(要求帧号沿轨迹有序)
+            # spatial:  位置门+朝向门筛选,逐步放宽(不依赖时间信息,2026-09-17)
+            if args.window_mode == "spatial":
+                neighbors = R.spatial_neighbors(
+                    ext_all, seed_frame, args.k, baseline,
+                    exclude={q_frame}, diversity=args.spatial_diversity)
+            else:
+                neighbors = R.temporal_neighbors(n, seed_frame, args.k,
+                                                 exclude={q_frame})
             topk_frames = np.array([seed_frame] + neighbors)
             topk = None  # 锚点不按 DB 索引,统一走 topk_frames + ext_all
             h_chosen = "seed"

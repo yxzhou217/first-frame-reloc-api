@@ -50,6 +50,115 @@ def camera_centers(extrinsic):
     return extrinsic[:, :3, 3].astype(np.float64)
 
 
+def temporal_neighbors(n_frames, seed, k, exclude=None):
+    """时间邻居窗口:主帧 ±1,±2,...,按 |Δ| 从小到大凑满 k-1 个。
+    返回邻居索引列表(不含 seed)。"""
+    exclude = set(exclude or [])
+    neighbors = []
+    d = 1
+    while len(neighbors) < k - 1 and d < n_frames:
+        for f in (seed - d, seed + d):
+            if 0 <= f < n_frames and f not in exclude and f not in neighbors:
+                neighbors.append(f)
+                if len(neighbors) >= k - 1:
+                    break
+        d += 1
+    return neighbors
+
+
+def spatial_neighbors(ext_c2w, seed, k, baseline, exclude=None,
+                      r0_mult=3.0, theta0_deg=60.0, r_max_mult=10.0,
+                      r_grow=1.5, theta_grow_deg=15.0, theta_max_deg=120.0,
+                      diversity=False):
+    """空间近邻窗口选择(不依赖帧号顺序,2026-09-17)。
+
+    动机:地图数据库若无时间信息(帧号不再沿轨迹有序),时间邻居窗口失效,
+    改用几何筛选:
+      1. 位置门: 与主帧距离 < R(初值 r0_mult×基线,随地图密度自适应)
+      2. 朝向门: 候选视线与主帧视线夹角 < θ(初值 60°,杀掉背对背/侧对;
+         用"与主帧同向"而非"看向主帧",放行并排看同一面墙的好锚点)
+      3. 排序: score = dist/R - 0.5·cos_view,越近越同向越好
+      4. 凑不齐就放宽(R×1.5, θ+15°),照搬时间邻居 ±d 扩圈的精神;
+         超过 r_max_mult×基线仍不够,兜底为全图最近邻(不管朝向)
+    选砸了由下游 Sim(3) 残差自检(residual > 2×基线判失败)接住,此处只管尽量选好。
+
+    ext_c2w: (N,4,4) c2w 位姿(+Z 为相机前向,OpenCV 约定;
+              lingbot 与 VidMap 地图均已实测验证该列与运动方向正相关)
+    seed:    主帧索引;  k: 含主帧的窗口大小
+    exclude: 不允许入选的帧号集合(如评估时的查询帧自身)
+    diversity: True 时加贪心方位多样性——每选一个锚点,压制与它方位相近
+               (从主帧看方向夹角 <30°)的剩余候选,防锚点全挤在主帧同一侧
+               (长廊场景窗口基线退化)。稀疏地图建议开,稠密地图可不开。
+    返回: 邻居帧索引列表(不含 seed),长度 <= k-1
+    """
+    n = ext_c2w.shape[0]
+    pos = ext_c2w[:, :3, 3].astype(np.float64)
+    dirs = ext_c2w[:, :3, 2].astype(np.float64)      # c2w 第三列 = 视线方向
+    p_s, d_s = pos[seed], dirs[seed]
+
+    blocked = set(exclude or []) | {seed}
+    avail = np.array([i for i in range(n) if i not in blocked])
+    if len(avail) == 0:
+        return []
+    dist = np.linalg.norm(pos[avail] - p_s, axis=1)
+    cos_view = dirs[avail] @ d_s
+
+    def pick(mask, need):
+        """在 mask 内按综合分取最多 need 个(可选方位多样性贪心)。"""
+        cand = np.where(mask)[0]
+        if len(cand) == 0 or need <= 0:
+            return []
+        score = dist[cand] / R - 0.5 * cos_view[cand]
+        order = cand[np.argsort(score)]
+        if not diversity:
+            return avail[order[:need]].tolist()
+        # 贪心多样性:选中的锚点记下方位(主帧→锚点的单位向量),
+        # 与已选方位夹角 <30° 的候选压到队尾;整圈无人入选则放弃多样性
+        chosen, chosen_bearings = [], []
+        pool = list(order)
+        skipped = 0
+        cos30 = np.cos(np.deg2rad(30.0))
+        while pool and len(chosen) < need:
+            i = pool.pop(0)
+            v = pos[avail[i]] - p_s
+            nv = np.linalg.norm(v)
+            b = v / nv if nv > 1e-12 else None
+            if b is not None and any(b @ pb > cos30 for pb in chosen_bearings):
+                pool.append(i)
+                skipped += 1
+                if skipped > len(pool):
+                    break               # 全员撞车,退出按分补满
+                continue
+            skipped = 0
+            chosen.append(avail[i])
+            if b is not None:
+                chosen_bearings.append(b)
+        # 多样性要求实在满足不了,按分补满
+        if len(chosen) < need:
+            for i in order:
+                if avail[i] not in chosen:
+                    chosen.append(avail[i])
+                    if len(chosen) >= need:
+                        break
+        return chosen[:need]
+
+    neighbors = []
+    R = r0_mult * baseline
+    theta = theta0_deg
+    while len(neighbors) < k - 1 and R <= r_max_mult * baseline:
+        mask = (dist < R) & (cos_view > np.cos(np.deg2rad(theta)))
+        mask &= ~np.isin(avail, neighbors)
+        neighbors += pick(mask, k - 1 - len(neighbors))
+        R *= r_grow
+        theta = min(theta + theta_grow_deg, theta_max_deg)
+
+    if len(neighbors) < k - 1:
+        # 兜底:全图最近邻(不看朝向),对应"宁要远帧也不要凑不齐窗口"
+        rest = [i for i in avail[np.argsort(dist)] if i not in neighbors]
+        neighbors += rest[:k - 1 - len(neighbors)]
+    return neighbors[:k - 1]
+
+
 def retrieve(query_desc, db_desc, k, exclude_idx=None):
     """余弦相似度 top-k 检索(描述子已 L2 归一化,点积=余弦)。"""
     sims = db_desc @ query_desc

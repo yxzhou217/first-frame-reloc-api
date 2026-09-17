@@ -182,17 +182,16 @@ class Localizer:
         if seed_frame is None:
             seed_frame = int(self.db_idx[cand[0]])
 
-        # 4. 主帧时间邻居凑满 k 个锚点(±1,±2,...,按 |Δ| 从小到大)
+        # 4. 凑满 k 个锚点,两种窗口模式(--window_mode):
+        #    temporal: 主帧时间邻居(±1,±2,...,按 |Δ| 从小到大)——要求帧号沿轨迹有序
+        #    spatial:  空间近邻(位置门+朝向门+逐步放宽,不依赖时间信息,2026-09-17)
         k = self.args.k
-        neighbors = []
-        d = 1
-        while len(neighbors) < k - 1 and d < self.n:
-            for f in (seed_frame - d, seed_frame + d):
-                if 0 <= f < self.n and f not in neighbors:
-                    neighbors.append(f)
-                    if len(neighbors) >= k - 1:
-                        break
-            d += 1
+        if self.args.window_mode == "spatial":
+            neighbors = R.spatial_neighbors(
+                self.ext_all, seed_frame, k, self.baseline,
+                diversity=self.args.spatial_diversity)
+        else:
+            neighbors = R.temporal_neighbors(self.n, seed_frame, k)
         anchor_frames = np.array([seed_frame] + neighbors)
 
         # 5. 窗口联合重建 + Sim(3) 对齐
@@ -223,6 +222,7 @@ class Localizer:
             },
             "debug": {
                 "seed_frame": seed_frame,
+                "window_mode": self.args.window_mode,
                 "vlm_yes_rank": vlm_yes_rank,                 # -1 = VLM 未确认(回退)
                 "anchor_frames": anchor_frames.tolist(),
                 "vlm_calls": vlm_calls,
@@ -246,10 +246,11 @@ def create_app(loc: Localizer):
     def health():
         return {
             "status": "ok",
-            "pipeline": "seed_expand (DINO检索 + VLM主帧 + 时间邻居窗口 + Sim3对齐)",
+            "pipeline": f"seed_expand (DINO检索 + VLM主帧 + {loc.args.window_mode}邻居窗口 + Sim3对齐)",
             "map_frames": loc.n,
             "db_frames": int(len(loc.db_idx)),
             "k": loc.args.k,
+            "window_mode": loc.args.window_mode,
             "vlm_enabled": loc.vlm is not None,
         }
 
@@ -308,6 +309,12 @@ def main():
                         default="checkpoints/lingbot-map-long.pt")
     parser.add_argument("--dino_path", default="facebook/dinov2-small")
     parser.add_argument("--k", type=int, default=8)
+    parser.add_argument("--window_mode", choices=["temporal", "spatial"],
+                        default="temporal",
+                        help="锚点窗口选取: temporal=主帧时间邻居(默认,需帧号沿轨迹有序); "
+                             "spatial=空间近邻(位置+朝向筛选,不依赖时间信息)")
+    parser.add_argument("--spatial_diversity", action="store_true",
+                        help="spatial 模式加贪心方位多样性(防锚点挤同一侧,稀疏地图建议开)")
     parser.add_argument("--target_db_ratio", type=float, default=0.46)
     parser.add_argument("--db_stride", type=int, default=None,
                         help="隔 N 帧取 1 帧作检索库(替代空间子采样;关键帧地图建议 2)")
