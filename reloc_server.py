@@ -320,7 +320,7 @@ def main():
     parser.add_argument("--db_stride", type=int, default=None,
                         help="隔 N 帧取 1 帧作检索库(替代空间子采样;关键帧地图建议 2)")
     parser.add_argument("--vlm_url", default="http://127.0.0.1:8000")
-    parser.add_argument("--vlm_model", default="Qwen/Qwen3-VL-8B-Instruct")
+    parser.add_argument("--vlm_model", default="qwen3.8-27b-fp8")
     parser.add_argument("--vlm_fetch", type=int, default=5)
     parser.add_argument("--no_vlm", action="store_true",
                         help="不用 VLM,直接 DINO top-1 作主帧(仅调试用)")

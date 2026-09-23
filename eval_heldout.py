@@ -131,7 +131,7 @@ def main():
                         help="启用 VLM 图片对验证过滤检索候选(需 Qwen3-VL 服务运行)")
     parser.add_argument("--vlm_url", default="http://127.0.0.1:8000",
                         help="VLM 服务地址")
-    parser.add_argument("--vlm_model", default="Qwen/Qwen3-VL-8B-Instruct",
+    parser.add_argument("--vlm_model", default="qwen3.8-27b-fp8",
                         help="VLM 模型名")
     parser.add_argument("--vlm_fetch", type=int, default=5,
                         help="送 VLM 验证的 DINOv2 top-K 候选数(建议 3~8)")

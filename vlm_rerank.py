@@ -1,7 +1,9 @@
 """vlm_rerank.py — VLM 图片对验证,用于首帧定位检索重排
 
-用 VLM (Qwen3-VL-8B / 兼容 OpenAI Vision API 的模型) 做"这两张图是否同一位置"
-的语义判断,过滤 DINOv2 检索中的视觉混淆候选。
+用 VLM (默认 qwen3.8-27b-fp8,兼容 OpenAI Vision API 的端点均可) 做
+"这两张图是否同一位置"的语义判断,过滤 DINOv2 检索中的视觉混淆候选。
+注意:推理型模型默认关闭思考(disable_thinking=True),否则回答会被思考过程
+吃光且单次调用 45s+;回答落在 reasoning 字段的情况已做兼容。
 
 两个使用模式:
 1) 远程服务模式(推荐): 调用已在服务器上运行的 Qwen3-VL 服务
@@ -144,12 +146,16 @@ class VLMVerifier:
     """
 
     base_url: str = field(default_factory=lambda: os.environ.get("VLM_URL", "http://127.0.0.1:8000"))
-    model: str = field(default_factory=lambda: os.environ.get("VLM_MODEL", "Qwen/Qwen3-VL-8B-Instruct"))
+    model: str = field(default_factory=lambda: os.environ.get("VLM_MODEL", "qwen3.8-27b-fp8"))
     api_key: str = field(default_factory=lambda: os.environ.get("VLM_API_KEY", ""))
     timeout: float = 120.0
     max_image_size: int = 768
     max_tokens: int = 8
     temperature: float = 0.0
+    # 推理型模型(如 qwen3.8-27b-fp8)必须关思考:思考会把 max_tokens 吃光导致
+    # content 为空且单次 45s+(2026-09-23 实测);关闭后 0.3~0.5s 且判断正确。
+    # 对非推理模型该参数被模板忽略,无害。
+    disable_thinking: bool = True
 
     system_prompt: str = RELOC_PROMPT_SYSTEM
     user_prompt: str = RELOC_PROMPT_USER
@@ -183,6 +189,8 @@ class VLMVerifier:
             "max_tokens": self.max_tokens,
             "stream": False,
         }
+        if self.disable_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
 
         url = f"{self.base_url.rstrip('/')}/v1/chat/completions"
         headers = {"Content-Type": "application/json"}
@@ -192,7 +200,9 @@ class VLMVerifier:
         resp.raise_for_status()
         body = resp.json()
 
-        raw_text = body["choices"][0]["message"]["content"]
+        # 推理型模型回答可能落在 reasoning 字段而 content 为 null,做兜底
+        msg = body["choices"][0]["message"]
+        raw_text = msg.get("content") or msg.get("reasoning") or ""
         is_match = parse_yes_no(raw_text) or False
 
         latency = (time.perf_counter() - t0) * 1000
@@ -281,7 +291,7 @@ FAILURE_CASES = [
 def selftest(
     npz_path: str = "output/short_stream_full.npz",
     base_url: str = "http://127.0.0.1:8000",
-    model: str = "Qwen/Qwen3-VL-8B-Instruct",
+    model: str = "qwen3.8-27b-fp8",
 ):
     """用 6 个已知失败案例测试 VLM 判别能力。
 
@@ -341,7 +351,7 @@ if __name__ == "__main__":
     parser.add_argument("--selftest", action="store_true", help="用 6 个失败案例自测")
     parser.add_argument("--npz", default="output/short_stream_full.npz", help="建图 npz 路径")
     parser.add_argument("--base_url", default="http://127.0.0.1:8000", help="VLM 服务地址")
-    parser.add_argument("--model", default="Qwen/Qwen3-VL-8B-Instruct", help="模型名")
+    parser.add_argument("--model", default="qwen3.8-27b-fp8", help="模型名")
     args = parser.parse_args()
 
     if args.selftest:
