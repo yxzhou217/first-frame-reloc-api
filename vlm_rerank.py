@@ -146,7 +146,7 @@ class VLMVerifier:
     """
 
     base_url: str = field(default_factory=lambda: os.environ.get("VLM_URL", "http://127.0.0.1:8000"))
-    model: str = field(default_factory=lambda: os.environ.get("VLM_MODEL", "qwen3.8-27b-fp8"))
+    model: str = field(default_factory=lambda: os.environ.get("VLM_MODEL", "Qwen/Qwen3-VL-8B-Instruct"))
     api_key: str = field(default_factory=lambda: os.environ.get("VLM_API_KEY", ""))
     timeout: float = 120.0
     max_image_size: int = 768
@@ -154,7 +154,7 @@ class VLMVerifier:
     temperature: float = 0.0
     # 推理型模型(如 qwen3.8-27b-fp8)必须关思考:思考会把 max_tokens 吃光导致
     # content 为空且单次 45s+(2026-09-23 实测);关闭后 0.3~0.5s 且判断正确。
-    # 对非推理模型该参数被模板忽略,无害。
+    # 对非推理模型(默认的 Qwen3-VL-8B)该参数被模板忽略,无害,已实测。
     disable_thinking: bool = True
 
     system_prompt: str = RELOC_PROMPT_SYSTEM

@@ -64,7 +64,7 @@ bash stop.sh               # 或 pkill -f reloc_server.py;前台运行则 Ctrl+C
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--map_npz` / `--db` / `--model_path` | — | 地图 / 检索库 / lingbot-map 权重(必填) |
-| `--vlm_url` / `--vlm_model` | — | VLM 端点(兼容 OpenAI Vision API)/ 模型名 |
+| `--vlm_url` / `--vlm_model` | 见下 | VLM 端点(兼容 OpenAI Vision API)/ 模型名 |
 | `--no_vlm` | 关 | 不用 VLM(仅调试,精度会降) |
 | `--k` | 8 | 窗口锚点数 |
 | `--window_mode` | `spatial` | 窗口选取:`spatial`=空间近邻(不依赖时间信息);`temporal`=时间邻居(需帧号有序) |
@@ -72,6 +72,20 @@ bash stop.sh               # 或 pkill -f reloc_server.py;前台运行则 Ctrl+C
 | `--db_stride` | 无 | 隔 N 取一作检索库;关键帧地图建议 2(稠密帧地图用默认的空间子采样即可) |
 | `--no_rotate` | 关 | 查询照片不顺时针转 90°(地图帧已转正时必须加) |
 | `--port` | 8100 | 监听端口;8100 被占或多实例时才需要改 |
+
+### VLM 端点配置
+
+VLM 服务地址和密钥**不进仓库**,启动时自己指定(三样缺一不可):
+
+```bash
+export VLM_API_KEY="<你的 VLM 密钥>"        # 服务端有鉴权时必填;注意有的代理对无密钥请求回 404 而非 401
+python reloc_server.py ... \
+    --vlm_url <你的 VLM 服务地址> \          # 如 http://<IP>:8000 或自建隧道地址
+    --vlm_model <该服务上的模型名>           # 如 Qwen/Qwen3-VL-8B-Instruct;模型名不对也会 404
+```
+
+推理型模型(回答带思考过程的)代码默认自动关思考(`disable_thinking`),无需手动处理;
+VLM 不可用时可加 `--no_vlm` 降级(DINO top-1 作主帧,失去语义兜底)。
 
 ## 调用
 
