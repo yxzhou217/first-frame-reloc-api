@@ -33,10 +33,12 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 import numpy as np
 from PIL import Image, ImageOps
 
+import cv2
 import relocalize as R
-from build_map_db import extract_descriptors
+from build_map_db import extract_descriptors, IMAGENET_MEAN, IMAGENET_STD
 from vlm_rerank import VLMVerifier
 from eval_heldout import spatial_subsample
+from image_quality_gate import ImageQualityGate, QualityConfig
 
 
 # =============================================================================
@@ -119,7 +121,56 @@ class Localizer:
         if not args.no_vlm:
             self.vlm = VLMVerifier(base_url=args.vlm_url, model=args.vlm_model)
             print(f"[启动] VLM 验证: {args.vlm_url} ({args.vlm_model})")
+
+        # patch 互匹配重排(默认开): 预计算库图 patch 特征
+        self.db_patches = None
+        if not args.no_patch_rerank:
+            print("[启动] 预计算库图 patch 特征(DINO 去 CLS, L2 归一化) ...")
+            _t0 = time.perf_counter()
+            self.db_patches = self._patch_feats(self.imgs_all)
+            print(f"[启动] patch 特征 {self.db_patches.shape}, 耗时 {time.perf_counter()-_t0:.1f}s")
+
+        # CPU 图像质检门禁(--min_quality 0 关闭)
+        self.quality_gate = None
+        if args.min_quality > 0:
+            self.quality_gate = ImageQualityGate(
+                QualityConfig(retry_threshold=args.min_quality))
+            print(f"[启动] 图像质检: 阈值 {args.min_quality}")
         print("[启动] 完成,服务就绪")
+
+    # ------------------------------------------------------------------
+    def _patch_feats(self, imgs_np, batch_size=16):
+        """(N,3,H,W) [0,1] → (N,P,D) fp16, DINO patch 特征(去 CLS, L2 归一化)。
+
+        预处理与 extract_descriptors 一致(ImageNet 归一化), 只改取 patch token。"""
+        torch = self.torch
+        mean = torch.from_numpy(IMAGENET_MEAN).view(1, 3, 1, 1).to(self.device)
+        std = torch.from_numpy(IMAGENET_STD).view(1, 3, 1, 1).to(self.device)
+        feats = []
+        for s in range(0, len(imgs_np), batch_size):
+            b = torch.from_numpy(imgs_np[s:s + batch_size]).float().to(self.device)
+            b = (b - mean) / std
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
+                out = self.dino(pixel_values=b)
+            p = out.last_hidden_state[:, 1:].float()          # 去 CLS
+            p = p / p.norm(dim=-1, keepdim=True)
+            feats.append(p.half().cpu().numpy())
+        return np.concatenate(feats, axis=0)
+
+    def _rerank_by_patches(self, qpatch, cand_idx):
+        """原始 MNN 重排(与 ab_patch_eval.py 的 raw 方法一致):
+        查询图与每个候选做 patch 互最近邻, 按互认对数降序。"""
+        torch = self.torch
+        q = torch.from_numpy(qpatch).float().to(self.device)
+        scores = []
+        for c in cand_idx:
+            cp = torch.from_numpy(self.db_patches[c]).float().to(self.device)
+            sim = cp @ q.T                                   # (Pc,Pq)
+            c2q = sim.argmax(dim=1)
+            q2c = sim.argmax(dim=0)
+            ok = q2c[c2q] == torch.arange(cp.shape[0], device=self.device)
+            scores.append(int(ok.sum()))
+        return cand_idx[np.argsort(-np.array(scores))]
 
     # ------------------------------------------------------------------
     def localize(self, pil_img: Image.Image, rotate: bool | None = None) -> dict:
@@ -137,6 +188,24 @@ class Localizer:
         t0 = time.perf_counter()
         warnings = []
 
+        # 0. CPU 图像质检门禁(先于一切 GPU 工作;低于阈值直接拒绝, 不执行定位)
+        if self.quality_gate is not None:
+            bgr = cv2.cvtColor(
+                np.asarray(ImageOps.exif_transpose(pil_img).convert("RGB")),
+                cv2.COLOR_RGB2BGR)
+            qres = self.quality_gate.evaluate(bgr)
+            if qres["action"] == "turn_and_retake":
+                return {
+                    "success": False,
+                    "error": f"画面信息不足(质量分 {qres['score']:.0f} < 阈值 {self.args.min_quality:.0f}),未执行定位",
+                    "quality": qres,
+                    "confidence": {"residual": None, "residual_x_baseline": None,
+                                   "inliers": "0/0"},
+                    "debug": {"seed_frame": None,
+                              "latency_ms": (time.perf_counter() - t0) * 1000},
+                    "warnings": [],
+                }
+
         # 1. 预处理 + 描述子
         if rotate is None:
             rotate = self.args.rotate_clockwise_90
@@ -147,6 +216,11 @@ class Localizer:
         # 2. DINO 检索(相似度只决定问 VLM 的顺序)
         fetch = min(self.args.vlm_fetch * 2, len(self.desc_db))
         cand = R.retrieve(qdesc, self.desc_db, k=fetch)
+
+        # 2.5 patch 互匹配重排(默认开; 把视野重叠度高的候选提前)
+        if self.db_patches is not None:
+            qpatch = self._patch_feats(qimg[None])[0]
+            cand = self._rerank_by_patches(qpatch, cand)
 
         # 3. VLM 按顺序验证,第一个 Yes = 主帧
         seed_frame = None
@@ -247,12 +321,14 @@ def create_app(loc: Localizer):
     def health():
         return {
             "status": "ok",
-            "pipeline": f"seed_expand (DINO检索 + VLM主帧 + {loc.args.window_mode}邻居窗口 + Sim3对齐)",
+            "pipeline": f"seed_expand (质检 + DINO检索 + patch重排 + VLM主帧 + {loc.args.window_mode}邻居窗口 + Sim3对齐)",
             "map_frames": loc.n,
             "db_frames": int(len(loc.db_idx)),
             "k": loc.args.k,
             "window_mode": loc.args.window_mode,
             "vlm_enabled": loc.vlm is not None,
+            "patch_rerank": loc.db_patches is not None,
+            "quality_gate": loc.args.min_quality,
         }
 
     @app.post("/localize")
@@ -324,6 +400,10 @@ def main():
     parser.add_argument("--vlm_fetch", type=int, default=5)
     parser.add_argument("--no_vlm", action="store_true",
                         help="不用 VLM,直接 DINO top-1 作主帧(仅调试用)")
+    parser.add_argument("--no_patch_rerank", action="store_true",
+                        help="关闭 patch 互匹配重排(默认开: DINO top-N 后按视野重叠度重排)")
+    parser.add_argument("--min_quality", type=float, default=40.0,
+                        help="CPU 图像质检阈值(0~100), 低于则拒绝定位; 0=关闭质检")
     parser.add_argument("--rotate_clockwise_90", action="store_true", default=True,
                         help="查询照片预处理时顺时针旋转90°(与 short.mp4 建图一致,默认开)")
     parser.add_argument("--no_rotate", dest="rotate_clockwise_90", action="store_false")
