@@ -1,7 +1,11 @@
 # 首帧定位 API(First-Frame Relocalization API)
 
 机器人"苏醒时拍一张照片 → 返回它在地图里的位姿"的 HTTP 服务。
-管线:DINOv2 检索 → VLM 逐对确认主帧 → 主帧邻居凑窗口(默认空间近邻,见下) → [lingbot-map](https://github.com/robbyant/lingbot-map) 窗口联合重建 → Sim(3) 对齐到地图坐标系。
+管线:CPU 图像质检 → DINOv2 检索 → patch 互匹配重排 → VLM 逐对确认主帧 → 主帧邻居凑窗口(默认空间近邻,见下) → [lingbot-map](https://github.com/robbyant/lingbot-map) 窗口联合重建 → Sim(3) 对齐到地图坐标系。
+
+**图像质检门禁**(2026-10-12 起,默认开):调用前先对查询图做纯 CPU 质检(约 10~15ms)——按 6×4 网格统计强角点覆盖与长线覆盖,综合成 0~100 的质量分;低于阈值(默认 40,`--min_quality` 调,0=关闭)直接返回失败(`error` 里带质量分),不占用 GPU。白墙/纯灰/严重模糊这类"没纹理"的图会被稳定拦下;但纹理多≠可定位(重复木纹、白噪声照样高分),通过只表示"可以尝试"。
+
+**patch 互匹配重排**(2026-10-12 起,默认开):DINO 按整图相似度取 top-N 后,对查询图与每个候选做 patch 级互最近邻匹配(候选 patch 与查询 patch 互为最爱才算一对),按互认对数重排——把"视野真正重叠"的候选提前,治重复纹理区"语义像但位置不同"的混淆。库图 patch 特征启动时预计算一次(每张约 777 patch)。`--no_patch_rerank` 可关闭回退到纯 DINO 序。
 
 **窗口选取两种模式**(`--window_mode`,默认 `spatial`):
 
@@ -71,6 +75,8 @@ bash stop.sh               # 或 pkill -f reloc_server.py;前台运行则 Ctrl+C
 | `--spatial_diversity` | 关 | spatial 模式加贪心方位多样性(稀疏地图建议开) |
 | `--db_stride` | 无 | 隔 N 取一作检索库;关键帧地图建议 2(稠密帧地图用默认的空间子采样即可) |
 | `--no_rotate` | 关 | 查询照片不顺时针转 90°(地图帧已转正时必须加) |
+| `--no_patch_rerank` | 关 | 关闭 patch 互匹配重排(回退纯 DINO 检索序) |
+| `--min_quality` | 40 | CPU 质检阈值(0~100),低于则拒绝定位;0=关闭质检 |
 | `--port` | 8100 | 监听端口;8100 被占或多实例时才需要改 |
 
 ### VLM 端点配置
@@ -111,7 +117,8 @@ else:
 
 | 字段 | 说明 |
 |---|---|
-| `success` | 是否可信(VLM 否决全部候选 / 对齐残差>2×基线 → false) |
+| `success` | 是否可信(质检不过 / VLM 否决全部候选 / 对齐残差>2×基线 → false) |
+| `quality` | 质检详情(分数/角点网格/线覆盖;仅质检开启时有,拒绝时随 error 返回) |
 | `position` / `quaternion_wxyz` / `rotation_matrix` | 位姿(地图单位;米制地图则为米) |
 | `scale` | Sim(3) 对齐尺度;米制地图上偏离 1 是正常的,看残差判断 |
 | `confidence` | `residual_x_baseline`(>2 可疑)、`inliers` |
@@ -135,8 +142,9 @@ python eval_heldout.py --map_npz /path/to/map.npz --db /path/to/db.npz \
 
 | 文件 | 作用 |
 |---|---|
-| `reloc_server.py` | API 服务本体 |
+| `reloc_server.py` | API 服务本体(含质检门禁与 patch 重排的接入) |
 | `relocalize.py` | 核心算法库(检索 / Sim(3) 对齐 / 窗口重建) |
+| `image_quality_gate.py` | CPU 图像质检(角点/长线覆盖评分) |
 | `vlm_rerank.py` | VLM 图片对验证 |
 | `build_map_db.py` | 构建检索数据库 |
 | `eval_via_api.py` / `eval_heldout.py` | 评估脚本(经 HTTP / 离线) |
