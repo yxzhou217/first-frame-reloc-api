@@ -77,6 +77,7 @@ bash stop.sh               # 或 pkill -f reloc_server.py;前台运行则 Ctrl+C
 | `--no_rotate` | 关 | 查询照片不顺时针转 90°(地图帧已转正时必须加) |
 | `--no_patch_rerank` | 关 | 关闭 patch 互匹配重排(回退纯 DINO 检索序) |
 | `--min_quality` | 40 | CPU 质检阈值(0~100),低于则拒绝定位;0=关闭质检 |
+| `--backend` | `lingbot` | 窗口重建后端:`lingbot`=流式近似;`vggt_omega`=全量注意力(更准,`--model_path` 指 vggt_omega_1b_512.pt,需 `pip install -e vggt-omega --no-deps`) |
 | `--port` | 8100 | 监听端口;8100 被占或多实例时才需要改 |
 
 ### VLM 端点配置
@@ -145,6 +146,7 @@ python eval_heldout.py --map_npz /path/to/map.npz --db /path/to/db.npz \
 | `reloc_server.py` | API 服务本体(含质检门禁与 patch 重排的接入) |
 | `relocalize.py` | 核心算法库(检索 / Sim(3) 对齐 / 窗口重建) |
 | `image_quality_gate.py` | CPU 图像质检(角点/长线覆盖评分) |
+| `recon_backend.py` | 窗口重建后端切换(lingbot / vggt-omega) |
 | `vlm_rerank.py` | VLM 图片对验证 |
 | `build_map_db.py` | 构建检索数据库 |
 | `eval_via_api.py` / `eval_heldout.py` | 评估脚本(经 HTTP / 离线) |
