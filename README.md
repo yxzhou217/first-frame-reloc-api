@@ -1,7 +1,7 @@
 # 首帧定位 API(First-Frame Relocalization API)
 
 机器人"苏醒时拍一张照片 → 返回它在地图里的位姿"的 HTTP 服务。
-管线:CPU 图像质检 → DINOv2 检索 → patch 互匹配重排 → VLM 逐对确认主帧 → 主帧邻居凑窗口(默认空间近邻,见下) → [lingbot-map](https://github.com/robbyant/lingbot-map) 窗口联合重建 → Sim(3) 对齐到地图坐标系。
+管线:CPU 图像质检 → DINOv2 检索 → patch 互匹配重排 → VLM 逐对确认主帧 → 主帧邻居凑窗口(默认空间近邻,见下) → lingbot-map / VGGT-Omega 窗口联合重建 → Sim(3) 对齐到地图坐标系。
 
 **图像质检门禁**(2026-10-12 起,默认开):调用前先对查询图做纯 CPU 质检(约 10~15ms)——按 6×4 网格统计强角点覆盖与长线覆盖,综合成 0~100 的质量分;低于阈值(默认 40,`--min_quality` 调,0=关闭)直接返回失败(`error` 里带质量分),不占用 GPU。白墙/纯灰/严重模糊这类"没纹理"的图会被稳定拦下;但纹理多≠可定位(重复木纹、白噪声照样高分),通过只表示"可以尝试"。
 
@@ -68,6 +68,7 @@ bash stop.sh               # 或 pkill -f reloc_server.py;前台运行则 Ctrl+C
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--map_npz` / `--db` / `--model_path` | — | 地图 / 检索库 / lingbot-map 权重(必填) |
+| `--map_image_dir` | 无 | VGGT-Omega 必填：原始地图图像目录，文件名按 map npz 的 `names` 字段对应帧号 |
 | `--vlm_url` / `--vlm_model` | 见下 | VLM 端点(兼容 OpenAI Vision API)/ 模型名 |
 | `--no_vlm` | 关 | 不用 VLM(仅调试,精度会降) |
 | `--k` | 8 | 窗口锚点数 |
@@ -79,6 +80,30 @@ bash stop.sh               # 或 pkill -f reloc_server.py;前台运行则 Ctrl+C
 | `--min_quality` | 40 | CPU 质检阈值(0~100),低于则拒绝定位;0=关闭质检 |
 | `--backend` | `lingbot` | 窗口重建后端:`lingbot`=流式近似;`vggt_omega`=全量注意力(更准,`--model_path` 指 vggt_omega_1b_512.pt,需 `pip install -e vggt-omega --no-deps`) |
 | `--port` | 8100 | 监听端口;8100 被占或多实例时才需要改 |
+
+### VGGT-Omega 重建输入
+
+检索、patch、VLM 继续使用原地图规格；Omega 重建独立读取查询原图及选中锚点的原图，执行官方 balanced 512/patch16 预处理。地图 npz 必须保留按帧对应的 `names`，并显式传入原图目录：
+
+```bash
+python reloc_server.py ... --backend vggt_omega \
+    --model_path /path/to/vggt_omega_1b_512.pt \
+    --map_image_dir /path/to/original_map_images
+```
+
+原图应采用建图时相同的地图帧方向；查询的 EXIF/可选旋转与检索分支一致。找不到原图或帧名时启动报错，避免悄悄使用低分辨率图。以 tower 960×540 为例，Omega 原图输入为 688×384；不能先经旧 518×294、fp16/uint8 中转后再放大为 672×384，否则与模型单测不等价。两个后端统一对外返回 c2w，Omega 解码的 w2c 只求逆一次。
+
+### 后端对照（2026-10-14）
+
+固定同一批50张的主帧与8锚点、质检40和残差2，仅替换重建后端/输入：
+
+| 后端 | XY<0.3m且yaw<3° | XY中位 | XY最大 |
+|---|---:|---:|---:|
+| LingBot |42/46|0.073m|0.387m|
+| 旧尺寸中转的Omega |45/46|0.017m|1.081m|
+| 原图Omega |46/46|0.023m|0.261m|
+
+4张质检拒绝不算成功。原图Omega另经真实API上传路由及VLM全流程回归，仍为46/46。probe10在同模型同窗口下由1.081m降到0.146m，确认旧尺寸中转影响结果。仅代表当前仿真集的XY/yaw；完整记录在服务器project/codex_roloc/eval_backends.json，现有运行服务未在本次重启。
 
 ### VLM 端点配置
 

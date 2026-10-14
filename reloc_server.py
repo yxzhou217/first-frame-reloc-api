@@ -25,6 +25,7 @@ import io
 import os
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # 须在 import torch 前
@@ -46,13 +47,8 @@ from recon_backend import load_backend
 # 图像预处理(必须与建图时完全一致)
 # =============================================================================
 
-def preprocess_query(pil_img: Image.Image, rotate_clockwise_90: bool,
-                     image_size: int = 518, patch_size: int = 14) -> np.ndarray:
-    """单张照片 → (3,518,518) fp16 [0,1],与建图时 load_and_preprocess_images
-    (mode="crop") 逐像素对齐:
-      EXIF 方向校正 → (可选)顺时针 90° → 宽缩放到 518(等比,高对齐 patch 倍数)
-      → 高 >518 时中心裁剪到 518。
-    """
+def prepare_query_image(pil_img: Image.Image, rotate_clockwise_90: bool) -> Image.Image:
+    """统一查询方向和颜色，保留原分辨率供重建后端使用。"""
     img = ImageOps.exif_transpose(pil_img)
     if img.mode == "RGBA":
         bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
@@ -60,6 +56,13 @@ def preprocess_query(pil_img: Image.Image, rotate_clockwise_90: bool,
     img = img.convert("RGB")
     if rotate_clockwise_90:
         img = img.transpose(Image.ROTATE_270)  # 与 my_demo --rotate_clockwise_90 相同
+    return img
+
+
+def preprocess_query(pil_img: Image.Image, rotate_clockwise_90: bool,
+                     image_size: int = 518, patch_size: int = 14) -> np.ndarray:
+    """查询图 → 旧地图一致的 fp16 检索图像；Omega 重建另用原图。"""
+    img = prepare_query_image(pil_img, rotate_clockwise_90)
 
     w, h = img.size
     new_w = image_size
@@ -96,6 +99,20 @@ class Localizer:
         self.imgs_all = map_data["images"][0]             # (N,3,518,518) fp16
         self.n = self.desc_all.shape[0]
         assert self.ext_all.shape[0] == self.n and self.imgs_all.shape[0] == self.n
+
+        # Omega must reconstruct from originals, not upsample the legacy map tensor.
+        self.raw_map_paths = None
+        if args.backend == "vggt_omega":
+            image_dir = getattr(args, "map_image_dir", None)
+            if not image_dir or "names" not in map_data.files:
+                raise ValueError("vggt_omega requires --map_image_dir and map npz names in frame order")
+            names = map_data["names"]
+            if names.ndim != 1 or len(names) != self.n:
+                raise ValueError("Map image names must match the map frame count")
+            self.raw_map_paths = [Path(image_dir) / str(name) for name in names]
+            missing = next((p for p in self.raw_map_paths if not p.is_file()), None)
+            if missing is not None:
+                raise FileNotFoundError(f"Original map image missing: {missing}")
 
         # 空间子采样 DB(与评估同参数,target_ratio=0.46);
         # --db_stride N 时改为隔 N 取一(关键帧地图推荐: VidMap 关键帧本身已按运动间距选出)
@@ -272,7 +289,14 @@ class Localizer:
         # 5. 窗口联合重建 + Sim(3) 对齐
         window = torch.from_numpy(
             np.stack([qimg] + [self.imgs_all[f] for f in anchor_frames]))
-        c2w_fresh = self.backend.window_c2w(window)
+        if self.raw_map_paths is None:
+            c2w_fresh = self.backend.window_c2w(window)
+        else:
+            raw_images = [prepare_query_image(pil_img, rotate)]
+            for f in anchor_frames:
+                with Image.open(self.raw_map_paths[f]) as image:
+                    raw_images.append(image.copy())
+            c2w_fresh = self.backend.window_c2w(window, raw_images=raw_images)
         s, Rm, t, res, inl = R.align_sim3_rotcons(
             c2w_fresh[1:], self.ext_all[anchor_frames])
         R_est = Rm @ c2w_fresh[0, :3, :3]
@@ -382,6 +406,8 @@ def create_app(loc: Localizer):
 def main():
     parser = argparse.ArgumentParser(description="首帧定位 API 服务(seed_expand)")
     parser.add_argument("--map_npz", default="output/short_stream_full.npz")
+    parser.add_argument("--map_image_dir", default=None,
+                        help="Omega 必填: 原始地图图像目录;map npz 的 names 必须按帧对应文件名")
     parser.add_argument("--db", default="output/short_stream_full_db.npz")
     parser.add_argument("--model_path",
                         default="checkpoints/lingbot-map-long.pt")
