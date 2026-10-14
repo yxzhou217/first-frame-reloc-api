@@ -40,6 +40,8 @@ python -m pip install -e ../vggt-omega --no-deps
 
 VGGT-Omega 重建会读取 `原图目录/names[i]`，独立执行官方预处理；原图必须保留，不能用 NPZ 中缩小的图代替。
 
+`images` 必须与 `reloc_server.py` 的 `preprocess_query()` 一致：宽缩至 518，高度按 14 对齐，超过 518 时中心裁剪。查询预处理后的尺寸须与地图 `images` 一致，通常使用同相机、同画幅；Omega 的重建原图单独保留。
+
 构建检索库：
 
 ```bash
