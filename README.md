@@ -1,182 +1,109 @@
-# 首帧定位 API(First-Frame Relocalization API)
+# 首帧定位 API
 
-机器人"苏醒时拍一张照片 → 返回它在地图里的位姿"的 HTTP 服务。
-管线:CPU 图像质检 → DINOv2 检索 → patch 互匹配重排 → VLM 逐对确认主帧 → 主帧邻居凑窗口(默认空间近邻,见下) → lingbot-map / VGGT-Omega 窗口联合重建 → Sim(3) 对齐到地图坐标系。
+输入一张照片，返回相机在已有地图中的位置和朝向。
 
-**图像质检门禁**(2026-10-12 起,默认开):调用前先对查询图做纯 CPU 质检(约 10~15ms)——按 6×4 网格统计强角点覆盖与长线覆盖,综合成 0~100 的质量分;低于阈值(默认 40,`--min_quality` 调,0=关闭)直接返回失败(`error` 里带质量分),不占用 GPU。白墙/纯灰/严重模糊这类"没纹理"的图会被稳定拦下;但纹理多≠可定位(重复木纹、白噪声照样高分),通过只表示"可以尝试"。
+流程：CPU 质检 → DINOv2 检索 → patch 重排 → VLM 确认 → 空间邻近锚点 → 窗口重建 → Sim(3) 对齐。
 
-**patch 互匹配重排**(2026-10-12 起,默认开):DINO 按整图相似度取 top-N 后,对查询图与每个候选做 patch 级互最近邻匹配(候选 patch 与查询 patch 互为最爱才算一对),按互认对数重排——把"视野真正重叠"的候选提前,治重复纹理区"语义像但位置不同"的混淆。库图 patch 特征启动时预计算一次(每张约 777 patch)。`--no_patch_rerank` 可关闭回退到纯 DINO 序。
+## 1. 安装环境
 
-**窗口选取两种模式**(`--window_mode`,默认 `spatial`):
-
-- `spatial`(默认,2026-09-17 起):空间近邻——以主帧位置为圆心、按"基线倍数"的半径画圈,再筛掉与主帧朝向夹角 >60° 的帧(防背对背),按"越近越同向"排序凑满窗口;凑不齐就放宽半径和锥角,最差退化为全图最近邻。**不依赖帧号沿轨迹有序**,回环处还能跨时间段选到空间上相近的帧(时间窗口做不到)。
-- `temporal`:主帧的时间邻居(±1,±2,...),仅当地图帧号沿轨迹有序时可用。
-
-稀疏地图建议加 `--spatial_diversity`(贪心方位多样性,防锚点全挤在主帧同一侧导致窗口基线退化)。
-
-## 环境安装
+需要 NVIDIA GPU。以下使用已验证的 Python 3.10、PyTorch 2.5.1 / CUDA 12.1 环境，以 VGGT-Omega 为重建后端。
 
 ```bash
-# 1. conda 环境(Python 3.10)
-conda create -n map python=3.10 -y && conda activate map
+conda create -n map python=3.10 -y
+conda activate map
 
-# 2. 上游 lingbot-map(窗口重建模型依赖)
-git clone https://github.com/robbyant/lingbot-map.git
-cd lingbot-map && pip install -e . && cd ..
-# 按上游 README 下载模型权重,记为 /path/to/lingbot-map-long.pt
+git clone https://github.com/yxzhou217/first-frame-reloc-api.git
+git clone https://github.com/facebookresearch/vggt-omega.git
+git -C vggt-omega checkout 282ec70363edeff59424bf43731658092fba3d37
+cd first-frame-reloc-api
 
-# 3. 本仓库
-git clone https://github.com/yxzhou217/first-frame-reloc-api && cd first-frame-reloc-api
-pip install -r requirements.txt
+python -m pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -r requirements.txt -r ../vggt-omega/requirements.txt \
+    "numpy==1.26.4" "opencv-python==4.11.0.86" "transformers==5.14.1"
+python -m pip install -e ../vggt-omega --no-deps
 ```
 
-首次运行会自动下载 DINOv2-small(~90MB);国内网络先 `export HF_ENDPOINT=https://hf-mirror.com`。
+最后一条是**可编辑安装**：让 `map` 环境能导入 `vggt_omega`，修改源码后无需重装；安装后保留该源码目录。`--no-deps` 表示依赖已由上一条命令安装。
 
-## 准备地图
+从 [VGGT-Omega 官方模型页](https://huggingface.co/facebook/VGGT-Omega)申请访问并下载 `vggt_omega_1b_512.pt`，放入 `../vggt-omega/checkpoints/`。首次启动会下载 DINOv2-small；离线部署可用 `--dino_path /path/to/local/dinov2-small` 指定本地模型目录。
 
-```bash
-# 建图 npz(images + 位姿 w2c + 内参)由 lingbot-map / VidMap 等工具产出
-# 然后构建检索数据库:
-python build_map_db.py --map_npz /path/to/map.npz --out /path/to/db.npz
-```
+## 2. 准备地图
 
-注意:建图帧若已旋正(如 VidMap 抽帧已应用旋转元数据),启动服务时须加 `--no_rotate`。查询照片的方向处理，必须和建图帧的方向处理保持一致。
+需要建图程序导出的 `map.npz`，以及按相同方向保存的地图原图目录。NPZ 中各字段须采用同一帧序：
 
-## 启动与停止
-
-```bash
-# 前台启动(测试用)
-export VLM_API_KEY="<你的 VLM key>"          # VLM 鉴权 key,从环境变量读,不写进任何文件
-python reloc_server.py \
-    --map_npz output/map.npz \
-    --db output/db.npz \
-    --model_path /path/to/lingbot-map-long.pt \
-    --vlm_url <VLM 服务地址> \
-    --no_rotate            # 地图帧已转正时加
-
-# 后台启动(生产用,默认 GPU 0,日志在 reloc_server.log)
-CUDA_VISIBLE_DEVICES=0 bash start.sh --map_npz ... --db ... --model_path ... [其它参数同上]
-
-# 停止
-bash stop.sh               # 或 pkill -f reloc_server.py;前台运行则 Ctrl+C
-```
-
-启动需 2~5 分钟加载模型,`curl http://127.0.0.1:8100/health` 返回 `{"status":"ok"}` 即就绪。
-
-常用参数:
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--map_npz` / `--db` / `--model_path` | — | 地图 / 检索库 / lingbot-map 权重(必填) |
-| `--map_image_dir` | 无 | VGGT-Omega 必填：原始地图图像目录，文件名按 map npz 的 `names` 字段对应帧号 |
-| `--vlm_url` / `--vlm_model` | 见下 | VLM 端点(兼容 OpenAI Vision API)/ 模型名 |
-| `--no_vlm` | 关 | 不用 VLM(仅调试,精度会降) |
-| `--k` | 8 | 窗口锚点数 |
-| `--window_mode` | `spatial` | 窗口选取:`spatial`=空间近邻(不依赖时间信息);`temporal`=时间邻居(需帧号有序) |
-| `--spatial_diversity` | 关 | spatial 模式加贪心方位多样性(稀疏地图建议开) |
-| `--db_stride` | 无 | 隔 N 取一作检索库;关键帧地图建议 2(稠密帧地图用默认的空间子采样即可) |
-| `--no_rotate` | 关 | 查询照片不顺时针转 90°(地图帧已转正时必须加) |
-| `--no_patch_rerank` | 关 | 关闭 patch 互匹配重排(回退纯 DINO 检索序) |
-| `--min_quality` | 40 | CPU 质检阈值(0~100),低于则拒绝定位;0=关闭质检 |
-| `--backend` | `lingbot` | 窗口重建后端:`lingbot`=流式近似;`vggt_omega`=全量注意力(更准,`--model_path` 指 vggt_omega_1b_512.pt,需 `pip install -e vggt-omega --no-deps`) |
-| `--port` | 8100 | 监听端口;8100 被占或多实例时才需要改 |
-
-### VGGT-Omega 重建输入
-
-检索、patch、VLM 继续使用原地图规格；Omega 重建独立读取查询原图及选中锚点的原图，执行官方 balanced 512/patch16 预处理。地图 npz 必须保留按帧对应的 `names`，并显式传入原图目录：
-
-```bash
-python reloc_server.py ... --backend vggt_omega \
-    --model_path /path/to/vggt_omega_1b_512.pt \
-    --map_image_dir /path/to/original_map_images
-```
-
-原图应采用建图时相同的地图帧方向；查询的 EXIF/可选旋转与检索分支一致。找不到原图或帧名时启动报错，避免悄悄使用低分辨率图。以 tower 960×540 为例，Omega 原图输入为 688×384；不能先经旧 518×294、fp16/uint8 中转后再放大为 672×384，否则与模型单测不等价。两个后端统一对外返回 c2w，Omega 解码的 w2c 只求逆一次。
-
-### 后端对照（2026-10-14）
-
-固定同一批50张的主帧与8锚点、质检40和残差2，仅替换重建后端/输入：
-
-| 后端 | XY<0.3m且yaw<3° | XY中位 | XY最大 |
-|---|---:|---:|---:|
-| LingBot |42/46|0.073m|0.387m|
-| 旧尺寸中转的Omega |45/46|0.017m|1.081m|
-| 原图Omega |46/46|0.023m|0.261m|
-
-4张质检拒绝不算成功。原图Omega另经真实API上传路由及VLM全流程回归，仍为46/46。probe10在同模型同窗口下由1.081m降到0.146m，确认旧尺寸中转影响结果。仅代表当前仿真集的XY/yaw；完整记录在服务器project/codex_roloc/eval_backends.json，现有运行服务未在本次重启。
-
-### VLM 端点配置
-
-VLM 服务地址和密钥**不进仓库**,启动时自己指定(三样缺一不可):
-
-```bash
-export VLM_API_KEY="<你的 VLM 密钥>"        # 服务端有鉴权时必填;注意有的代理对无密钥请求回 404 而非 401
-python reloc_server.py ... \
-    --vlm_url <你的 VLM 服务地址> \          # 如 http://<IP>:8000 或自建隧道地址
-    --vlm_model <该服务上的模型名>           # 如 Qwen/Qwen3-VL-8B-Instruct;模型名不对也会 404
-```
-
-推理型模型(回答带思考过程的)代码默认自动关思考(`disable_thinking`),无需手动处理;
-VLM 不可用时可加 `--no_vlm` 降级(DINO top-1 作主帧,失去语义兜底)。
-
-## 调用
-
-```bash
-# 上传文件(比如查询图的路径为photo.jpg)
-curl -X POST http://127.0.0.1:8100/localize -F "file=@photo.jpg"
-
-```
-
-```python
-# 代码中调用api
-import requests
-with open("photo.jpg", "rb") as f:
-    res = requests.post("http://127.0.0.1:8100/localize",
-                        files={"file": ("photo.jpg", f, "image/jpeg")}, timeout=60).json()
-if res["success"]:
-    print(res["position"], res["quaternion_wxyz"])   # 位置 + 姿态(四元数 wxyz)
-else:
-    print(res.get("error") or res["warnings"])
-```
-
-返回字段:
-
-| 字段 | 说明 |
+| 字段 | 格式 |
 |---|---|
-| `success` | 是否可信(质检不过 / VLM 否决全部候选 / 对齐残差>2×基线 → false) |
-| `quality` | 质检详情(分数/角点网格/线覆盖;仅质检开启时有,拒绝时随 error 返回) |
-| `position` / `quaternion_wxyz` / `rotation_matrix` | 位姿(地图单位;米制地图则为米) |
-| `scale` | Sim(3) 对齐尺度;米制地图上偏离 1 是正常的,看残差判断 |
-| `confidence` | `residual_x_baseline`(>2 可疑)、`inliers` |
-| `debug` | `seed_frame`、`vlm_calls`、`latency_ms` 等 |
+| `images` | `(1,N,3,H,W)`，RGB、取值 `[0,1]`，供检索使用 |
+| `extrinsic` | `(N,3,4)`，**w2c** 外参 |
+| `intrinsic` | `(N,3,3)`，对应预处理后图像的内参 |
+| `names` | `(N,)`，原图相对文件名；`names[i]` 必须对应第 i 帧 |
 
-## 精度评估(可选)
+VGGT-Omega 重建会读取 `原图目录/names[i]`，独立执行官方预处理；原图必须保留，不能用 NPZ 中缩小的图代替。
+
+构建检索库：
 
 ```bash
-# 服务运行中,把留出帧当查询打给 API(真值取自地图自身,属自洽性评估)
-python eval_via_api.py --num_queries 100 --map_npz /path/to/map.npz --db /path/to/db.npz
-# 关键帧地图加 --db_stride 2(与服务启动一致);--num_queries 999 = 查询全测
-
-# 离线评估(不经 HTTP,可对比窗口模式等开关)
-python eval_heldout.py --map_npz /path/to/map.npz --db /path/to/db.npz \
-    --seed_expand --window_mode spatial --num_queries 30
-# 注意:关键帧地图(VidMap/COLMAP 关键帧已按运动阈值稀疏化)须加 --exclude_radius 0,
-# 否则默认排除查询 ±30 帧会把合法近邻全部砍掉,误差虚高数十倍
+conda activate map
+CUDA_VISIBLE_DEVICES=7 python build_map_db.py --map_npz /path/to/map.npz --out /path/to/db.npz
 ```
 
-## 文件说明
+## 3. 启动服务
 
-| 文件 | 作用 |
-|---|---|
-| `reloc_server.py` | API 服务本体(含质检门禁与 patch 重排的接入) |
-| `relocalize.py` | 核心算法库(检索 / Sim(3) 对齐 / 窗口重建) |
-| `image_quality_gate.py` | CPU 图像质检(角点/长线覆盖评分) |
-| `recon_backend.py` | 窗口重建后端切换(lingbot / vggt-omega) |
-| `vlm_rerank.py` | VLM 图片对验证 |
-| `build_map_db.py` | 构建检索数据库 |
-| `eval_via_api.py` / `eval_heldout.py` | 评估脚本(经 HTTP / 离线) |
-| `start.sh` / `stop.sh` | 后台启停(含依赖检查、GPU 指定) |
+替换下面的路径、VLM 地址和模型名。示例使用 GPU7、端口 8101，按部署机器调整；VLM 密钥只通过环境变量提供。
 
-## 许可
+```bash
+conda activate map
+export VLM_API_KEY="你的密钥"
 
-Apache License 2.0。本项目构建于 [lingbot-map](https://github.com/robbyant/lingbot-map)(Apache 2.0)之上。
+CUDA_VISIBLE_DEVICES=7 python reloc_server.py \
+    --backend vggt_omega \
+    --model_path ../vggt-omega/checkpoints/vggt_omega_1b_512.pt \
+    --map_npz /path/to/map.npz \
+    --db /path/to/db.npz \
+    --map_image_dir /path/to/original_map_images \
+    --vlm_url "https://your-vlm-endpoint" \
+    --vlm_model "Qwen/Qwen3-VL-8B-Instruct" \
+    --db_stride 1 --spatial_diversity --no_rotate \
+    --port 8101
+```
+
+- `--map_image_dir`：Omega 必填，配合地图的 `names` 读取原图。
+- `--db_stride 1`：保留全部地图帧参与检索，关键点地图使用此设置。
+- `--no_rotate`：查询不额外旋转；地图帧已经旋正时使用。查询与地图方向须一致，省略此项会将查询顺时针旋转 90°。
+- 质检、patch 重排和空间窗口默认开启；质检阈值默认 40，锚点数默认 8。可用 `--min_quality`、`--k` 调整；`--no_vlm` 仅供不调用 VLM 的调试。
+
+检查就绪：
+
+```bash
+curl http://127.0.0.1:8101/health
+```
+
+返回 `"status":"ok"` 后再请求定位。前台服务按 `Ctrl+C` 停止；后台运行可将相同启动参数传给 `bash start.sh`。
+
+## 4. 请求定位
+
+```bash
+curl -X POST http://127.0.0.1:8101/localize \
+    -F "file=@/path/to/query.jpg"
+```
+
+仅在 `success=true` 时使用位姿：
+
+- `position`：地图坐标系中的相机位置，单位与地图一致。
+- `quaternion_wxyz` / `rotation_matrix`：地图坐标系中的相机朝向，四元数顺序为 **w,x,y,z**。
+- `confidence`：对齐残差和内点数；`debug` 包含主帧、锚点及耗时。
+- `success=false`：查看 `error` 或 `warnings`；质检拒绝时还会返回 `quality`。
+
+## 5. 切换到 LingBot-map（可选）
+
+在同一 `map` 环境安装：
+
+```bash
+git clone https://github.com/robbyant/lingbot-map.git ../lingbot-map
+git -C ../lingbot-map checkout 1f480aeb8a47a24656090d46d053115b7fe60435
+python -m pip install -e ../lingbot-map "numpy==1.26.4" "opencv-python==4.11.0.86"
+```
+
+从 [LingBot-map 官方模型页](https://huggingface.co/robbyant/lingbot-map)下载 `lingbot-map-long.pt`。沿用上面的启动命令，将 `--backend` 改为 `lingbot`、`--model_path` 改为该权重路径，并去掉 `--map_image_dir`。代码默认后端仍为 `lingbot`，使用 Omega 时必须显式指定 `--backend vggt_omega`。
+
+许可：[Apache License 2.0](LICENSE)。
