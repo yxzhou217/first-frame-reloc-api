@@ -39,6 +39,7 @@ from build_map_db import extract_descriptors, IMAGENET_MEAN, IMAGENET_STD
 from vlm_rerank import VLMVerifier
 from eval_heldout import spatial_subsample
 from image_quality_gate import ImageQualityGate, QualityConfig
+from recon_backend import load_backend
 
 
 # =============================================================================
@@ -109,9 +110,8 @@ class Localizer:
             np.diff(ext_db[:, :3, 3], axis=0), axis=1).mean())
         print(f"[启动] 地图 {self.n} 帧,DB {len(self.db_idx)} 帧,基线 {self.baseline:.4f}")
 
-        print("[启动] 加载 lingbot-map 模型 ...")
-        self.model = R.load_lingbot_model(
-            SimpleNamespace(model_path=args.model_path), self.device)
+        print(f"[启动] 加载窗口重建后端 {args.backend} ...")
+        self.backend = load_backend(args.backend, args.model_path, self.device)
 
         print(f"[启动] 加载描述子模型 {args.dino_path} ...")
         from transformers import AutoModel
@@ -272,7 +272,7 @@ class Localizer:
         # 5. 窗口联合重建 + Sim(3) 对齐
         window = torch.from_numpy(
             np.stack([qimg] + [self.imgs_all[f] for f in anchor_frames]))
-        c2w_fresh = R.run_window_c2w(self.model, window, self.device, self.dtype)
+        c2w_fresh = self.backend.window_c2w(window)
         s, Rm, t, res, inl = R.align_sim3_rotcons(
             c2w_fresh[1:], self.ext_all[anchor_frames])
         R_est = Rm @ c2w_fresh[0, :3, :3]
@@ -329,6 +329,7 @@ def create_app(loc: Localizer):
             "vlm_enabled": loc.vlm is not None,
             "patch_rerank": loc.db_patches is not None,
             "quality_gate": loc.args.min_quality,
+            "backend": loc.args.backend,
         }
 
     @app.post("/localize")
@@ -384,6 +385,9 @@ def main():
     parser.add_argument("--db", default="output/short_stream_full_db.npz")
     parser.add_argument("--model_path",
                         default="checkpoints/lingbot-map-long.pt")
+    parser.add_argument("--backend", choices=["lingbot", "vggt_omega"], default="lingbot",
+                        help="窗口重建后端: lingbot=流式近似(默认); vggt_omega=全量注意力"
+                             "(更准, model_path 指 vggt_omega_1b_512.pt, 需 vggt-omega 包)")
     parser.add_argument("--dino_path", default="facebook/dinov2-small")
     parser.add_argument("--k", type=int, default=8)
     parser.add_argument("--window_mode", choices=["temporal", "spatial"],
